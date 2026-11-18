@@ -45,3 +45,8 @@ ai_gateway_consumers:
     name: document-extraction
     display_name: document-extraction
     type: api-key
+  - ref: custom-consumer-group--document-modification
+    ai_gateway: target
+    name: document-modification
+    display_name: document-modification
+    type: api-key

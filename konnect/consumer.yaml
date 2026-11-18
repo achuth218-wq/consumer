@@ -16,6 +16,4 @@ ai_gateway_consumers:
     display_name: Custom app
     type: api-key
     name: atlas
-    display_name: atlas
-    type: api-key
 

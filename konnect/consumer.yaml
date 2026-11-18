@@ -40,3 +40,8 @@ ai_gateway_consumers:
     name: document-summarizer
     display_name: Document Summarizer
     type: api-key
+  - ref: custom-consumer-group--document-extraction
+    ai_gateway: target
+    name: document-extraction
+    display_name: document-extraction
+    type: api-key

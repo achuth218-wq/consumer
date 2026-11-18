@@ -1,0 +1,100 @@
+name: Konnect AI Gateway consumer
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['konnect/consumer.yaml']
+  push:
+    branches: [main]
+    paths: ['konnect/consumer.yaml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  configure:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.actor != 'dependabot[bot]') ||
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+       github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('konnect-consumer-pr-{0}', github.event.pull_request.number) || 'konnect-ai-gateway-main-apply' }}
+      queue: max
+    defaults:
+      run:
+        shell: bash
+    env:
+      KONGCTL_DEFAULT_KONNECT_REGION: ${{ vars.KONNECT_REGION || 'us' }}
+      AI_GATEWAY_ID: ${{ vars.AI_GATEWAY_ID }}
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || 'refs/heads/main' }}
+          persist-credentials: false
+
+      - uses: kong/setup-kongctl@v1
+        with:
+          kongctl-version: '1.28.1'
+
+      - name: Plan consumer changes against live Konnect
+        env:
+          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
+        run: |
+          : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set KONNECT_TOKEN in repository secrets}"
+          [[ "$KONGCTL_DEFAULT_KONNECT_REGION" == us ]] || { echo "::error::Set KONNECT_REGION to us"; exit 1; }
+          python3 -c 'from uuid import UUID; import os; UUID(os.environ["AI_GATEWAY_ID"])'
+          kongctl plan --mode apply -f konnect/consumer.yaml --output-file "$RUNNER_TEMP/plan.json"
+
+      - name: Preview individual membership changes
+        env:
+          KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
+        run: /usr/bin/python3 .github/scripts/memberships.py preview > "$RUNNER_TEMP/membership.txt"
+
+      - name: Format pull request diff
+        if: github.event_name == 'pull_request'
+        run: |
+          kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text > "$RUNNER_TEMP/diff.txt"
+          cat "$RUNNER_TEMP/membership.txt" >> "$RUNNER_TEMP/diff.txt"
+          {
+            echo '### Konnect consumer diff'
+            # Indented Markdown keeps the diff literal, including embedded backticks.
+            head -c 8000 "$RUNNER_TEMP/diff.txt" | sed 's/^/    /'
+            if (( $(wc -c < "$RUNNER_TEMP/diff.txt") > 8000 )); then
+              echo; echo 'Diff truncated. See the workflow summary for the full preview.'
+            fi
+          } > "$RUNNER_TEMP/comment.md"
+          sed 's/^/    /' "$RUNNER_TEMP/diff.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post consumer diff
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: konnect-consumer-diff
+          path: ${{ runner.temp }}/comment.md
+
+      - name: Check consumer deployment scope
+        run: |
+          jq -e '(.changes // []) | all(.[];
+                  .resource_type == "ai_gateway_consumer" and .action == "CREATE")' "$RUNNER_TEMP/plan.json" > /dev/null || {
+            echo "::error::Plan exceeds the consumer workflow scope. Review the diff and deploy group or policy changes through konnect-policy first."
+            exit 1
+          }
+
+      - name: Apply consumer configuration
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
+        run: kongctl apply --plan "$RUNNER_TEMP/plan.json" --auto-approve -o text
+
+      - name: Reconcile individual memberships
+        if: github.event_name != 'pull_request'
+        env:
+          KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
+        run: /usr/bin/python3 .github/scripts/memberships.py apply

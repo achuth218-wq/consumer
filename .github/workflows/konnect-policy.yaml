@@ -28,6 +28,7 @@ jobs:
       - uses: kong/setup-kongctl@v1
         with:
           kongctl-version: '1.28.1'
+
       - name: List visible India AI Gateways
         env:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
@@ -52,6 +53,7 @@ jobs:
       KONGCTL_DEFAULT_KONNECT_REGION: ${{ vars.KONNECT_REGION || 'in' }}
       AI_GATEWAY_ID: ${{ vars.AI_GATEWAY_ID }}
       NO_COLOR: '1'
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,18 +70,27 @@ jobs:
           AI_GATEWAY_NAME: ${{ vars.AI_GATEWAY_NAME }}
         run: |
           : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set KONNECT_TOKEN in repository secrets}"
-          [[ "$KONGCTL_DEFAULT_KONNECT_REGION" == in ]] || { echo "::error::Set KONNECT_REGION to in"; exit 1; }
+
+          if [[ "$KONGCTL_DEFAULT_KONNECT_REGION" != in ]]; then
+            echo "::error::Set KONNECT_REGION to in"
+            exit 1
+          fi
+
           target="${AI_GATEWAY_NAME:-$AI_GATEWAY_ID}"
           if [[ -z "$target" ]] || ! kongctl get ai-gateway --region in -o json -- "$target" > "$RUNNER_TEMP/gateway.json"; then
             echo "::error::Choose your gateway from the India AI Gateway list below. Set AI_GATEWAY_ID to its full ID or AI_GATEWAY_NAME to its exact display name."
             kongctl list ai-gateways --region in --text-id-format full
             exit 1
           fi
+
           id=$(jq -er '.id | strings' "$RUNNER_TEMP/gateway.json")
           python3 -c 'from uuid import UUID; import sys; UUID(sys.argv[1])' "$id"
+
           if [[ -n "$AI_GATEWAY_NAME" ]]; then
-            jq -e --arg name "$AI_GATEWAY_NAME" '.display_name == $name' "$RUNNER_TEMP/gateway.json" > /dev/null
+            jq -e --arg name "$AI_GATEWAY_NAME" \
+              '.display_name == $name' "$RUNNER_TEMP/gateway.json" > /dev/null
           fi
+
           echo "AI_GATEWAY_ID=$id" >> "$GITHUB_ENV"
           echo "Resolved India AI Gateway ID: $id"
 
@@ -88,9 +99,72 @@ jobs:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
         run: |
           : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set KONNECT_TOKEN in repository secrets}"
-          [[ "$KONGCTL_DEFAULT_KONNECT_REGION" == in ]] || { echo "::error::Set KONNECT_REGION to in"; exit 1; }
+
+          if [[ "$KONGCTL_DEFAULT_KONNECT_REGION" != in ]]; then
+            echo "::error::Set KONNECT_REGION to in"
+            exit 1
+          fi
+
           python3 -c 'from uuid import UUID; import os; UUID(os.environ["AI_GATEWAY_ID"])'
+
           for attempt in 1 2 3; do
-            if kongctl plan --region in --mode apply -f konnect/policy.yaml --output-file "$RUNNER_TEMP/plan.json" 2>"$RUNNER_TEMP/plan.err"; then
+            if kongctl plan --region in --mode apply \
+                -f konnect/policy.yaml \
+                --output-file "$RUNNER_TEMP/plan.json" \
+                2>"$RUNNER_TEMP/plan.err"; then
               cat "$RUNNER_TEMP/plan.err" >&2
               break
+            else
+              status=$?
+            fi
+
+            cat "$RUNNER_TEMP/plan.err" >&2
+
+            if [[ "$attempt" == 3 ]] || ! grep -Fq 'TLS handshake timeout' "$RUNNER_TEMP/plan.err"; then
+              exit "$status"
+            fi
+
+            echo "::warning::TLS handshake timed out during planning. Retrying in $((attempt * 5)) seconds."
+            sleep "$((attempt * 5))"
+          done
+
+      - name: Format pull request diff
+        if: github.event_name == 'pull_request'
+        run: |
+          kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text > "$RUNNER_TEMP/diff.txt"
+
+          {
+            echo '### Konnect policy diff'
+            head -c 8000 "$RUNNER_TEMP/diff.txt" | sed 's/^/    /'
+            if (( $(wc -c < "$RUNNER_TEMP/diff.txt") > 8000 )); then
+              echo
+              echo 'Diff truncated. See the workflow summary for the full preview.'
+            fi
+          } > "$RUNNER_TEMP/comment.md"
+
+          sed 's/^/    /' "$RUNNER_TEMP/diff.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post policy diff
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: konnect-policy-diff
+          path: ${{ runner.temp }}/comment.md
+
+      - name: Check policy deployment scope
+        run: |
+          jq -e 'all(.changes[]?;
+                  (.resource_type == "ai_gateway_policy" or .resource_type == "ai_gateway_consumer_group") and
+                  (.action == "CREATE" or .action == "UPDATE") and
+                  ((.fields // {}) | has("consumers") | not) and
+                  ((.changed_fields // {}) | has("consumers") | not))' \
+              "$RUNNER_TEMP/plan.json" > /dev/null || {
+            echo "::error::Plan exceeds the policy workflow scope. Review the planned resource types, actions, and membership fields."
+            exit 1
+          }
+
+      - name: Apply policy configuration
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
+        run: kongctl apply --region in --plan "$RUNNER_TEMP/plan.json" --auto-approve -o text

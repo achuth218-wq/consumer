@@ -1,0 +1,91 @@
+name: Konnect AI Gateway policy
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['konnect/policy.yaml']
+  push:
+    branches: [main]
+    paths: ['konnect/policy.yaml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  configure:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.actor != 'dependabot[bot]') ||
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+       github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('konnect-policy-pr-{0}', github.event.pull_request.number) || 'konnect-ai-gateway-main-apply' }}
+      queue: max
+    defaults:
+      run:
+        shell: bash
+    env:
+      KONGCTL_DEFAULT_KONNECT_REGION: ${{ vars.KONNECT_REGION || 'us' }}
+      AI_GATEWAY_ID: ${{ vars.AI_GATEWAY_ID }}
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || 'refs/heads/main' }}
+          persist-credentials: false
+
+      - uses: kong/setup-kongctl@v1
+        with:
+          kongctl-version: '1.28.1'
+
+      - name: Plan policy changes against live Konnect
+        env:
+          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
+        run: |
+          : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set KONNECT_TOKEN in repository secrets}"
+          [[ "$KONGCTL_DEFAULT_KONNECT_REGION" == us ]] || { echo "::error::Set KONNECT_REGION to us"; exit 1; }
+          python3 -c 'from uuid import UUID; import os; UUID(os.environ["AI_GATEWAY_ID"])'
+          kongctl plan --mode apply -f konnect/policy.yaml --output-file "$RUNNER_TEMP/plan.json"
+
+      - name: Format pull request diff
+        if: github.event_name == 'pull_request'
+        run: |
+          kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text > "$RUNNER_TEMP/diff.txt"
+          {
+            echo '### Konnect policy diff'
+            # Indented Markdown keeps the diff literal, including embedded backticks.
+            head -c 8000 "$RUNNER_TEMP/diff.txt" | sed 's/^/    /'
+            if (( $(wc -c < "$RUNNER_TEMP/diff.txt") > 8000 )); then
+              echo; echo 'Diff truncated. See the workflow summary for the full preview.'
+            fi
+          } > "$RUNNER_TEMP/comment.md"
+          sed 's/^/    /' "$RUNNER_TEMP/diff.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post policy diff
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: konnect-policy-diff
+          path: ${{ runner.temp }}/comment.md
+
+      - name: Check policy deployment scope
+        run: |
+          jq -e 'all(.changes[]?;
+                  (.resource_type == "ai_gateway_policy" or .resource_type == "ai_gateway_consumer_group") and
+                  (.action == "CREATE" or .action == "UPDATE") and
+                  ((.fields // {}) | has("consumers") | not) and
+                  ((.changed_fields // {}) | has("consumers") | not))' "$RUNNER_TEMP/plan.json" > /dev/null || {
+            echo "::error::Plan exceeds the policy workflow scope. Review the diff and deploy group or policy changes through konnect-policy first."
+            exit 1
+          }
+
+      - name: Apply policy configuration
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
+        run: kongctl apply --plan "$RUNNER_TEMP/plan.json" --auto-approve -o text

@@ -55,7 +55,7 @@ jobs:
       - name: Preview individual membership changes
         env:
           KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
-        run: /usr/bin/python3 .github/scripts/memberships.py preview > "$RUNNER_TEMP/membership.txt"
+        run: /usr/bin/python3 .github/workflows/memberships.py preview > "$RUNNER_TEMP/membership.txt"
 
       - name: Format pull request diff
         if: github.event_name == 'pull_request'

@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: Environment to deploy
+        description: Environment to preview or deploy
         required: true
         type: choice
         default: sandbox
@@ -33,20 +33,25 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.user.login != 'dependabot[bot]' &&
        github.actor != 'dependabot[bot]') ||
-      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' &&
+       startsWith(github.ref, 'refs/heads/'))
 
     strategy:
       fail-fast: false
       matrix:
         target: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.target) || '["sandbox","dev","test","prod"]') }}
 
-    name: consumer / ${{ matrix.target }}
+    name: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'Deploy' || 'Preview' }} consumers / ${{ matrix.target }}
     runs-on: ubuntu-latest
 
-    environment: ${{ github.event_name == 'pull_request' && 'konnect-preview' || matrix.target }}
+    # Only main deployment jobs enter sandbox, dev, test, or prod.
+    # PRs and feature-branch runs use the read-only preview credential.
+    environment: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && matrix.target || 'konnect-preview' }}
 
     concurrency:
-      group: ${{ github.event_name == 'pull_request' && format('konnect-consumer-pr-{0}-{1}', github.event.number, matrix.target) || format('konnect-apply-{0}', matrix.target) }}
+      # Main deployments share this lock with the policy workflow.
+      group: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && format('konnect-apply-{0}', matrix.target) || format('konnect-consumer-preview-{0}-{1}', github.ref, matrix.target) }}
       queue: max
 
     defaults:
@@ -54,56 +59,86 @@ jobs:
         shell: bash
 
     env:
-      NO_COLOR: '1'
-      KONGCTL_DEFAULT_KONNECT_REGION: in
+      KONGCTL_DEFAULT_KONNECT_REGION: ${{ vars.KONNECT_REGION || 'in' }}
       AI_GATEWAY_ID: ${{ vars[format('{0}_AI_GATEWAY_ID', matrix.target)] }}
+      TARGET_ENV: ${{ matrix.target }}
+      DEPLOY: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'true' || 'false' }}
+      NO_COLOR: '1'
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the selected revision
+        uses: actions/checkout@v4
         with:
+          # Manual runs use the selected branch's commit.
+          # PR runs use GitHub's PR merge commit.
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: kong/setup-kongctl@v1
+      - name: Install kongctl
+        uses: kong/setup-kongctl@v1
         with:
           kongctl-version: '1.28.1'
 
-      - name: Check approved revision
-        if: github.event_name != 'pull_request'
+      - name: Check deployment revision
+        if: env.DEPLOY == 'true'
         run: |
           if ! git diff --quiet HEAD origin/main -- \
-              konnect/consumer.yaml .github/workflows/konnect-consumer.yaml memberships.py; then
-            echo "::error::Consumer deployment files have changed on main. Start a new run on main."
+              konnect/consumer.yaml \
+              .github/workflows/konnect-consumer.yaml \
+              memberships.py; then
+            echo "::error::Consumer deployment files have changed on main. Start a new run."
             exit 1
           fi
 
-      - name: Check target gateway reference
+      - name: Validate selected gateway and consumer manifest
         run: |
+          if [[ "$KONGCTL_DEFAULT_KONNECT_REGION" != "in" ]]; then
+            echo "::error::Set KONNECT_REGION to in for the India gateways."
+            exit 1
+          fi
+
+          if [[ -z "$AI_GATEWAY_ID" ]]; then
+            echo "::error::Set the ${TARGET_ENV^^}_AI_GATEWAY_ID repository variable."
+            exit 1
+          fi
+
           /usr/bin/python3 - <<'PY'
           import os
           from pathlib import Path
           from uuid import UUID
+
           import yaml
 
           class Loader(yaml.SafeLoader):
               pass
 
-          Loader.add_constructor("!env", lambda loader, node: ("env", loader.construct_scalar(node)))
-          Loader.add_constructor("!ref", lambda loader, node: loader.construct_scalar(node))
+          Loader.add_constructor(
+              "!env",
+              lambda loader, node: ("env", loader.construct_scalar(node)),
+          )
 
-          UUID(os.environ["AI_GATEWAY_ID"])
-          config = yaml.load(Path("konnect/consumer.yaml").read_text(), Loader=Loader)
+          try:
+              UUID(os.environ["AI_GATEWAY_ID"])
+          except ValueError:
+              raise SystemExit("AI_GATEWAY_ID must be a valid gateway UUID")
+
+          manifest = yaml.load(Path("konnect/consumer.yaml").read_text(), Loader=Loader)
           expected = [{"ref": "target", "_external": {"id": ("env", "AI_GATEWAY_ID")}}]
-          if config.get("ai_gateways") != expected:
-              raise SystemExit("Set the external gateway target to id: !env AI_GATEWAY_ID")
+          if manifest.get("ai_gateways") != expected:
+              raise SystemExit("Use a single external gateway target with id: !env AI_GATEWAY_ID")
           PY
+
+          echo "Environment: $TARGET_ENV"
+          echo "Gateway: $AI_GATEWAY_ID"
+          echo "Revision: $GITHUB_SHA"
+          echo "Deployment enabled: $DEPLOY"
 
       - name: Plan consumer changes against live Konnect
         env:
-          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets[github.event_name == 'pull_request' && 'KONNECT_PREVIEW_TOKEN' || 'KONNECT_DEPLOY_TOKEN'] }}
+          KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets[env.DEPLOY == 'true' && 'KONNECT_DEPLOY_TOKEN' || 'KONNECT_PREVIEW_TOKEN'] }}
         run: |
-          : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set the Konnect token for this GitHub environment}"
+          : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set the Konnect secret in the selected GitHub environment}"
 
           for attempt in 1 2 3; do
             if kongctl plan --region in --mode apply \
@@ -125,28 +160,36 @@ jobs:
             sleep "$((attempt * 5))"
           done
 
-      - name: Preview individual memberships
+      - name: Preview individual membership changes
         env:
-          KONNECT_TOKEN: ${{ secrets[github.event_name == 'pull_request' && 'KONNECT_PREVIEW_TOKEN' || 'KONNECT_DEPLOY_TOKEN'] }}
-        run: /usr/bin/python3 ./memberships.py preview > "$RUNNER_TEMP/membership.txt"
+          KONNECT_TOKEN: ${{ secrets[env.DEPLOY == 'true' && 'KONNECT_DEPLOY_TOKEN' || 'KONNECT_PREVIEW_TOKEN'] }}
+        run: |
+          /usr/bin/python3 ./memberships.py preview > "$RUNNER_TEMP/membership.txt"
 
-      - name: Format pull request diff
-        if: github.event_name == 'pull_request'
+      - name: Format preview and write Actions summary
+        if: env.DEPLOY == 'false'
         run: |
           kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text > "$RUNNER_TEMP/diff.txt"
+          printf '\nMembership changes\n' >> "$RUNNER_TEMP/diff.txt"
           cat "$RUNNER_TEMP/membership.txt" >> "$RUNNER_TEMP/diff.txt"
+
           {
-            echo "### Konnect consumer diff — ${{ matrix.target }}"
+            echo "### Consumer preview — $TARGET_ENV"
+            echo
+            sed 's/^/    /' "$RUNNER_TEMP/diff.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "### Konnect consumer diff — $TARGET_ENV"
             echo
             head -c 8000 "$RUNNER_TEMP/diff.txt" | sed 's/^/    /'
             if (( $(wc -c < "$RUNNER_TEMP/diff.txt") > 8000 )); then
               echo
-              echo "See the workflow summary for the full diff."
+              echo "See the Actions summary for the complete diff."
             fi
           } > "$RUNNER_TEMP/comment.md"
-          sed 's/^/    /' "$RUNNER_TEMP/diff.txt" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Post consumer diff
+      - name: Post consumer diff on the pull request
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
@@ -156,22 +199,25 @@ jobs:
       - name: Check consumer deployment scope
         run: |
           jq -e '
-            ((.changes // []) | type == "array") and
-            all(.changes[]?;
-              .resource_type == "ai_gateway_consumer" and .action == "CREATE")
+            (.changes // []) |
+            type == "array" and
+            all(.[]; .resource_type == "ai_gateway_consumer" and .action == "CREATE")
           ' "$RUNNER_TEMP/plan.json" > /dev/null || {
-            echo "::error::Plan exceeds the consumer workflow scope."
+            echo "::error::The plan includes changes outside consumer creation. Review the diff."
             exit 1
           }
 
       - name: Apply consumer configuration
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: env.DEPLOY == 'true'
         env:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_DEPLOY_TOKEN }}
-        run: kongctl apply --region in --plan "$RUNNER_TEMP/plan.json" --auto-approve -o text
+        run: |
+          kongctl apply --region in \
+            --plan "$RUNNER_TEMP/plan.json" \
+            --auto-approve -o text
 
-      - name: Apply individual memberships
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      - name: Reconcile individual memberships
+        if: env.DEPLOY == 'true'
         env:
           KONNECT_TOKEN: ${{ secrets.KONNECT_DEPLOY_TOKEN }}
         run: /usr/bin/python3 ./memberships.py apply

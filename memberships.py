@@ -53,16 +53,18 @@ def current_groups(name, preview):
         if error.code == 404 and preview:
             return set()
         raise
-    collection = path + "/consumer-groups"
+    return {item["name"] for item in list_items(path + "/consumer-groups")}
+
+
+def list_items(collection):
     page_path = collection
-    groups = set()
     seen = set()
     while True:
         page = request("GET", page_path)
-        groups.update(item["name"] for item in page["data"])
+        yield from page["data"]
         following = page["meta"]["page"]["next"]
         if not following:
-            return groups
+            return
         # Only reuse the cursor. All authenticated requests stay on the India host.
         cursor = parse_qs(urlsplit(following).query)["page[after]"][0]
         if cursor in seen:
@@ -77,7 +79,18 @@ def reconcile(manifest, preview):
         raise ValueError("Consumer manifest must target the configured AI_GATEWAY_ID")
     if any(item["ai_gateway"] != "target" for item in manifest["ai_gateway_consumers"]):
         raise ValueError("Every consumer must use the target AI Gateway")
-    ids = {g: str(UUID(request("GET", "consumer-groups/" + g)["id"])) for g in sorted(GROUPS)}
+    ids = {
+        group["name"]: str(UUID(group["id"]))
+        for group in list_items("consumer-groups")
+        if group["name"] in GROUPS
+    }
+    missing = GROUPS - ids.keys()
+    if missing:
+        raise ValueError(
+            "Missing AI consumer groups on the configured India gateway: "
+            + ", ".join(sorted(missing))
+            + ". Deploy konnect/policy.yaml on this gateway, then rerun the consumer workflow."
+        )
     changed = False
     for name, target in desired.items():
         current = current_groups(name, preview)
@@ -100,4 +113,12 @@ if __name__ == "__main__":
     if mode not in {"apply", "preview"}:
         raise SystemExit("Use preview or apply")
     document = yaml.load(Path("konnect/consumer.yaml").read_text(), Loader=ManifestLoader)
-    reconcile(document, preview=mode == "preview")
+    try:
+        reconcile(document, preview=mode == "preview")
+    except HTTPError as error:
+        raise SystemExit(
+            f"Konnect returned HTTP {error.code} for {error.url}. "
+            "Check the India AI gateway ID and token access for this endpoint."
+        ) from None
+    except ValueError as error:
+        raise SystemExit(str(error)) from None

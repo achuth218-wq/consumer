@@ -1,0 +1,17 @@
+ai_gateways:
+  - ref: target
+    _external:
+      id: !env AI_GATEWAY_ID
+
+# ref format: <target-group>--<consumer-name>. To move a consumer, change only the group prefix.
+ai_gateway_consumers:
+  - ref: default-consumer-group--default-app
+    ai_gateway: target
+    name: default-app
+    display_name: Default app
+    type: api-key
+  - ref: custom-consumer-group--custom-app
+    ai_gateway: target
+    name: custom-app
+    display_name: Custom app
+    type: api-key

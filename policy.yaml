@@ -1,0 +1,63 @@
+ai_gateways:
+  - ref: target
+    _external:
+      id: !env AI_GATEWAY_ID
+
+ai_gateway_policies:
+  - ref: default-token-limit
+    ai_gateway: target
+    name: default-token-limit
+    display_name: Default group token limit
+    enabled: true
+    global: false
+    type: ai-rate-limiting-advanced
+    config:
+      identifier: consumer-group
+      strategy: local
+      tokens_count_strategy: total_tokens
+      policies:
+        - match:
+            - type: consumer_group
+              key: name
+              values: [default-consumer-group]
+          window_type: sliding
+          limits:
+            - limit: 50000
+              window_size: 60
+              tokens_count_strategy: total_tokens
+  - ref: custom-token-limit
+    ai_gateway: target
+    name: custom-token-limit
+    display_name: Custom group token limit
+    enabled: true
+    global: false
+    type: ai-rate-limiting-advanced
+    config:
+      identifier: consumer-group
+      strategy: local
+      tokens_count_strategy: total_tokens
+      policies:
+        - match:
+            - type: consumer_group
+              key: name
+              values: [custom-consumer-group]
+          window_type: sliding
+          limits:
+            - limit: 100000
+              window_size: 60
+              tokens_count_strategy: total_tokens
+
+# Omit consumers here to preserve the membership managed by the other workflow.
+ai_gateway_consumer_groups:
+  - ref: default-consumer-group
+    ai_gateway: target
+    name: default-consumer-group
+    display_name: Default consumer group
+    policies:
+      - !ref default-token-limit#name
+  - ref: custom-consumer-group
+    ai_gateway: target
+    name: custom-consumer-group
+    display_name: Custom consumer group
+    policies:
+      - !ref custom-token-limit#name

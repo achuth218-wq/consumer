@@ -1,7 +1,7 @@
 ai_gateways:
   - ref: target
     _external:
-      id: 2f1349cc-2016-4c81-b1d2-6ba96888c1b6
+      id: !env AI_GATEWAY_ID
 
 # ref format: <target-group>--<consumer-name>. To move a consumer, change only the group prefix.
 ai_gateway_consumers:

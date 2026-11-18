@@ -22,17 +22,22 @@ jobs:
        github.actor != 'dependabot[bot]') ||
       ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
        github.ref == 'refs/heads/main')
+
     runs-on: ubuntu-latest
+
     concurrency:
       group: ${{ github.event_name == 'pull_request' && format('konnect-consumer-pr-{0}', github.event.pull_request.number) || 'konnect-ai-gateway-main-apply' }}
       queue: max
+
     defaults:
       run:
         shell: bash
+
     env:
       KONGCTL_DEFAULT_KONNECT_REGION: ${{ vars.KONNECT_REGION || 'in' }}
       AI_GATEWAY_ID: ${{ vars.AI_GATEWAY_ID }}
       NO_COLOR: '1'
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,14 +48,56 @@ jobs:
         with:
           kongctl-version: '1.28.1'
 
+      - name: Check TLS connectivity to Konnect India
+        run: |
+          if ! curl --silent --show-error \
+            --connect-timeout 15 \
+            --max-time 30 \
+            --output /dev/null \
+            --write-out 'HTTP %{http_code} | TLS handshake completed at %{time_appconnect}s\n' \
+            'https://in.api.konghq.com/v1/ai-gateways'; then
+            echo "::warning::Connectivity check failed. The plan step will try the authenticated request."
+          fi
+
       - name: Plan consumer changes against live Konnect
         env:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
         run: |
           : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set KONNECT_TOKEN in repository secrets}"
-          [[ "$KONGCTL_DEFAULT_KONNECT_REGION" == in ]] || { echo "::error::Set KONNECT_REGION to in"; exit 1; }
+          : "${AI_GATEWAY_ID:?Set AI_GATEWAY_ID in repository variables}"
+
+          if [[ "$KONGCTL_DEFAULT_KONNECT_REGION" != "in" ]]; then
+            echo "::error::Set the KONNECT_REGION repository variable to in."
+            exit 1
+          fi
+
           python3 -c 'from uuid import UUID; import os; UUID(os.environ["AI_GATEWAY_ID"])'
-          kongctl plan --mode apply -f konnect/consumer.yaml --output-file "$RUNNER_TEMP/plan.json"
+
+          for attempt in 1 2 3; do
+            echo "Planning consumer changes in India (attempt $attempt of 3)."
+
+            if kongctl plan \
+              --region in \
+              --mode apply \
+              -f konnect/consumer.yaml \
+              --output-file "$RUNNER_TEMP/plan.json" \
+              2>"$RUNNER_TEMP/plan.err"; then
+              cat "$RUNNER_TEMP/plan.err" >&2
+              break
+            else
+              status=$?
+            fi
+
+            cat "$RUNNER_TEMP/plan.err" >&2
+
+            if [[ "$attempt" == 3 ]] || ! grep -Fq 'TLS handshake timeout' "$RUNNER_TEMP/plan.err"; then
+              exit "$status"
+            fi
+
+            delay=$((attempt * 5))
+            echo "::warning::TLS handshake timed out. Retrying the plan in $delay seconds."
+            sleep "$delay"
+          done
 
       - name: Preview individual membership changes
         env:
@@ -62,14 +109,16 @@ jobs:
         run: |
           kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text > "$RUNNER_TEMP/diff.txt"
           cat "$RUNNER_TEMP/membership.txt" >> "$RUNNER_TEMP/diff.txt"
+
           {
             echo '### Konnect consumer diff'
-            # Indented Markdown keeps the diff literal, including embedded backticks.
             head -c 8000 "$RUNNER_TEMP/diff.txt" | sed 's/^/    /'
             if (( $(wc -c < "$RUNNER_TEMP/diff.txt") > 8000 )); then
-              echo; echo 'Diff truncated. See the workflow summary for the full preview.'
+              echo
+              echo 'Diff truncated. See the workflow summary for the full preview.'
             fi
           } > "$RUNNER_TEMP/comment.md"
+
           sed 's/^/    /' "$RUNNER_TEMP/diff.txt" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post consumer diff
@@ -82,16 +131,17 @@ jobs:
       - name: Check consumer deployment scope
         run: |
           jq -e '(.changes // []) | all(.[];
-                  .resource_type == "ai_gateway_consumer" and .action == "CREATE")' "$RUNNER_TEMP/plan.json" > /dev/null || {
-            echo "::error::Plan exceeds the consumer workflow scope. Review the diff and deploy group or policy changes through konnect-policy first."
-            exit 1
-          }
+                  .resource_type == "ai_gateway_consumer" and .action == "CREATE")' \
+            "$RUNNER_TEMP/plan.json" > /dev/null || {
+              echo "::error::Plan exceeds the consumer workflow scope. Review the diff and deploy group or policy changes through konnect-policy first."
+              exit 1
+            }
 
       - name: Apply consumer configuration
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         env:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_TOKEN }}
-        run: kongctl apply --plan "$RUNNER_TEMP/plan.json" --auto-approve -o text
+        run: kongctl apply --region in --plan "$RUNNER_TEMP/plan.json" --auto-approve -o text
 
       - name: Reconcile individual memberships
         if: github.event_name != 'pull_request'

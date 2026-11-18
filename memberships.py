@@ -34,7 +34,7 @@ def assignments(manifest):
 
 def request(method, path, body=None):
     gateway = UUID(os.environ["AI_GATEWAY_ID"])
-    url = f"https://us.api.konghq.com/v1/ai-gateways/{gateway}/{path}"
+    url = f"https://in.api.konghq.com/v1/ai-gateways/{gateway}/{path}"
     headers = {"Authorization": "Bearer " + os.environ["KONNECT_TOKEN"]}
     data = None
     if body is not None:
@@ -63,7 +63,7 @@ def current_groups(name, preview):
         following = page["meta"]["page"]["next"]
         if not following:
             return groups
-        # Only reuse the cursor. All authenticated requests stay on the US host.
+        # Only reuse the cursor. All authenticated requests stay on the India host.
         cursor = parse_qs(urlsplit(following).query)["page[after]"][0]
         if cursor in seen:
             raise ValueError("Repeated membership page cursor")

@@ -3,10 +3,10 @@ name: Konnect AI Gateway consumer
 on:
   pull_request:
     branches: [main]
-    paths: ['consumer.yaml']
+    paths: ['konnect/consumer.yaml']
   push:
     branches: [main]
-    paths: ['consumer.yaml']
+    paths: ['konnect/consumer.yaml']
   workflow_dispatch:
 
 permissions:

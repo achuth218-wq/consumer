@@ -15,9 +15,7 @@ ai_gateway_consumers:
     name: custom-app
     display_name: Custom app
     type: api-key
-  - ref: custom-consumer-group--custom-app
-    ai_gateway: target
     name: atlas
-    display_name: Custom app
+    display_name: atlas
     type: api-key
 

@@ -97,4 +97,4 @@ jobs:
         if: github.event_name != 'pull_request'
         env:
           KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
-        run: /usr/bin/python3 .github/scripts/memberships.py apply
+        run: /usr/bin/python3 .github/workflows/memberships.py apply

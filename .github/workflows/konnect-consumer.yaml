@@ -45,12 +45,12 @@ jobs:
     name: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'Deploy' || 'Preview' }} consumers / ${{ matrix.target }}
     runs-on: ubuntu-latest
 
-    # Only main deployment jobs enter sandbox, dev, test, or prod.
-    # PRs and feature-branch runs use the read-only preview credential.
+    # Deployment jobs use the target environment and its approval rules.
+    # PR and feature-branch jobs use a read-only preview environment.
     environment: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && matrix.target || 'konnect-preview' }}
 
     concurrency:
-      # Main deployments share this lock with the policy workflow.
+      # The policy workflow must use the same konnect-apply-{target} group.
       group: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && format('konnect-apply-{0}', matrix.target) || format('konnect-consumer-preview-{0}-{1}', github.ref, matrix.target) }}
       queue: max
 
@@ -69,8 +69,6 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@v4
         with:
-          # Manual runs use the selected branch's commit.
-          # PR runs use GitHub's PR merge commit.
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
@@ -92,6 +90,7 @@ jobs:
           fi
 
       - name: Validate selected gateway and consumer manifest
+        id: validate
         run: |
           if [[ "$KONGCTL_DEFAULT_KONNECT_REGION" != "in" ]]; then
             echo "::error::Set KONNECT_REGION to in for the India gateways."
@@ -130,17 +129,27 @@ jobs:
           PY
 
           echo "Environment: $TARGET_ENV"
-          echo "Gateway: $AI_GATEWAY_ID"
-          echo "Revision: $GITHUB_SHA"
+          echo "India gateway: $AI_GATEWAY_ID"
+          echo "Commit: $GITHUB_SHA"
           echo "Deployment enabled: $DEPLOY"
 
-      - name: Plan consumer changes against live Konnect
+      - name: Plan | Generate consumer plan
+        id: consumer_plan
         env:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets[env.DEPLOY == 'true' && 'KONNECT_DEPLOY_TOKEN' || 'KONNECT_PREVIEW_TOKEN'] }}
         run: |
-          : "${KONGCTL_DEFAULT_KONNECT_PAT:?Set the Konnect secret in the selected GitHub environment}"
+          if [[ -z "$KONGCTL_DEFAULT_KONNECT_PAT" ]]; then
+            if [[ "$DEPLOY" == "true" ]]; then
+              echo "::error::Set KONNECT_DEPLOY_TOKEN in the $TARGET_ENV GitHub environment."
+            else
+              echo "::error::Set KONNECT_PREVIEW_TOKEN in the konnect-preview GitHub environment."
+            fi
+            exit 1
+          fi
 
           for attempt in 1 2 3; do
+            echo "Planning consumer changes for $TARGET_ENV (attempt $attempt of 3)"
+
             if kongctl plan --region in --mode apply \
                 -f konnect/consumer.yaml \
                 --output-file "$RUNNER_TEMP/plan.json" \
@@ -152,7 +161,9 @@ jobs:
             fi
 
             cat "$RUNNER_TEMP/plan.err" >&2
+
             if [[ "$attempt" == 3 ]] || ! grep -Fq 'TLS handshake timeout' "$RUNNER_TEMP/plan.err"; then
+              echo "::error::Consumer planning failed for $TARGET_ENV (exit $status)."
               exit "$status"
             fi
 
@@ -160,32 +171,55 @@ jobs:
             sleep "$((attempt * 5))"
           done
 
-      - name: Preview individual membership changes
-        env:
-          KONNECT_TOKEN: ${{ secrets[env.DEPLOY == 'true' && 'KONNECT_DEPLOY_TOKEN' || 'KONNECT_PREVIEW_TOKEN'] }}
-        run: |
-          /usr/bin/python3 ./memberships.py preview > "$RUNNER_TEMP/membership.txt"
+          count=$(jq -r '(.changes // []) | length' "$RUNNER_TEMP/plan.json")
+          echo "Planned resource changes: $count"
+          echo "resource_count=$count" >> "$GITHUB_OUTPUT"
 
-      - name: Format preview and write Actions summary
-        if: env.DEPLOY == 'false'
+      - name: Plan | Show consumer resource diff
+        id: plan_diff
         run: |
-          kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text > "$RUNNER_TEMP/diff.txt"
-          printf '\nMembership changes\n' >> "$RUNNER_TEMP/diff.txt"
-          cat "$RUNNER_TEMP/membership.txt" >> "$RUNNER_TEMP/diff.txt"
+          kongctl diff --plan "$RUNNER_TEMP/plan.json" -o text \
+            > "$RUNNER_TEMP/diff.txt"
+
+          echo "::group::Consumer resource diff for $TARGET_ENV"
+          cat "$RUNNER_TEMP/diff.txt"
+          echo "::endgroup::"
 
           {
-            echo "### Consumer preview — $TARGET_ENV"
+            echo "### Consumer plan — $TARGET_ENV"
             echo
             sed 's/^/    /' "$RUNNER_TEMP/diff.txt"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Plan | Preview individual memberships
+        id: membership_preview
+        env:
+          KONNECT_TOKEN: ${{ secrets[env.DEPLOY == 'true' && 'KONNECT_DEPLOY_TOKEN' || 'KONNECT_PREVIEW_TOKEN'] }}
+        run: |
+          echo "Checking consumer group assignments on $TARGET_ENV"
+          /usr/bin/python3 -u ./memberships.py preview | tee "$RUNNER_TEMP/membership.txt"
+
+          {
+            echo "### Membership preview — $TARGET_ENV"
+            echo
+            sed 's/^/    /' "$RUNNER_TEMP/membership.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Format pull request comment
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            cat "$RUNNER_TEMP/diff.txt"
+            printf '\nMembership changes\n'
+            cat "$RUNNER_TEMP/membership.txt"
+          } > "$RUNNER_TEMP/preview.txt"
+
           {
             echo "### Konnect consumer diff — $TARGET_ENV"
             echo
-            head -c 8000 "$RUNNER_TEMP/diff.txt" | sed 's/^/    /'
-            if (( $(wc -c < "$RUNNER_TEMP/diff.txt") > 8000 )); then
-              echo
-              echo "See the Actions summary for the complete diff."
+            head -c 8000 "$RUNNER_TEMP/preview.txt" | sed 's/^/    /'
+            if (( $(wc -c < "$RUNNER_TEMP/preview.txt") > 8000 )); then
+              printf '\n\nSee the Actions summary for the complete diff.\n'
             fi
           } > "$RUNNER_TEMP/comment.md"
 
@@ -196,7 +230,8 @@ jobs:
           header: konnect-consumer-${{ matrix.target }}
           path: ${{ runner.temp }}/comment.md
 
-      - name: Check consumer deployment scope
+      - name: Plan | Check consumer deployment scope
+        id: scope_check
         run: |
           jq -e '
             (.changes // []) |
@@ -207,17 +242,63 @@ jobs:
             exit 1
           }
 
-      - name: Apply consumer configuration
+          echo "Consumer deployment scope check passed for $TARGET_ENV."
+
+      - name: Apply | Deploy consumer configuration
+        id: consumer_apply
         if: env.DEPLOY == 'true'
         env:
           KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONNECT_DEPLOY_TOKEN }}
         run: |
+          echo "Applying saved consumer plan to $TARGET_ENV"
+          echo "Gateway: $AI_GATEWAY_ID"
+          echo "Commit: $GITHUB_SHA"
+
           kongctl apply --region in \
             --plan "$RUNNER_TEMP/plan.json" \
             --auto-approve -o text
 
-      - name: Reconcile individual memberships
+          echo "Consumer apply completed successfully for $TARGET_ENV."
+
+      - name: Apply | Reconcile individual memberships
+        id: membership_apply
         if: env.DEPLOY == 'true'
         env:
           KONNECT_TOKEN: ${{ secrets.KONNECT_DEPLOY_TOKEN }}
-        run: /usr/bin/python3 ./memberships.py apply
+        run: |
+          echo "Reconciling consumer group assignments on $TARGET_ENV"
+          /usr/bin/python3 -u ./memberships.py apply
+          echo "Membership apply completed successfully for $TARGET_ENV."
+
+      - name: Report plan and apply results
+        if: always()
+        env:
+          VALIDATION_RESULT: ${{ steps.validate.outcome }}
+          PLAN_RESULT: ${{ steps.consumer_plan.outcome }}
+          RESOURCE_COUNT: ${{ steps.consumer_plan.outputs.resource_count }}
+          DIFF_RESULT: ${{ steps.plan_diff.outcome }}
+          PREVIEW_RESULT: ${{ steps.membership_preview.outcome }}
+          SCOPE_RESULT: ${{ steps.scope_check.outcome }}
+          APPLY_RESULT: ${{ steps.consumer_apply.outcome }}
+          MEMBERSHIP_RESULT: ${{ steps.membership_apply.outcome }}
+        run: |
+          {
+            echo "### Consumer workflow results — $TARGET_ENV"
+            echo
+            echo "Planned resource changes: ${RESOURCE_COUNT:-unavailable}"
+            echo
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Validate gateway and manifest | $VALIDATION_RESULT |"
+            echo "| Generate consumer plan | $PLAN_RESULT |"
+            echo "| Show consumer diff | $DIFF_RESULT |"
+            echo "| Preview memberships | $PREVIEW_RESULT |"
+            echo "| Check deployment scope | $SCOPE_RESULT |"
+            echo "| Apply consumers | $APPLY_RESULT |"
+            echo "| Apply memberships | $MEMBERSHIP_RESULT |"
+
+            if [[ "$DEPLOY" == "false" ]]; then
+              echo
+              echo "Read-only preview. Both apply stages are skipped."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"

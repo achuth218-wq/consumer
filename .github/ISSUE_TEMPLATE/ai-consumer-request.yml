@@ -1,0 +1,104 @@
+name: "🟣 AI Gateway consumer request"
+description: Request a new API-key consumer or move an existing consumer to another group.
+title: "[AI consumer] "
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 🔵 Consumer details
+
+        Submit one request per application on the India AI Gateway.
+        Keep API keys and Konnect tokens out of this issue.
+
+  - type: dropdown
+    id: request_type
+    attributes:
+      label: Request type
+      description: Choose the change you need.
+      options:
+        - Create a consumer
+        - Move an existing consumer
+    validations:
+      required: true
+
+  - type: input
+    id: consumer_name
+    attributes:
+      label: Consumer name
+      description: For a new consumer, use a name such as claims-review-api. For a move, enter the exact existing name.
+      placeholder: claims-review-api
+    validations:
+      required: true
+
+  - type: input
+    id: display_name
+    attributes:
+      label: Display name
+      description: Enter the application name as it should appear in Konnect. For a move, copy the existing display name.
+      placeholder: Claims Review API
+    validations:
+      required: true
+
+  - type: input
+    id: owner
+    attributes:
+      label: Application owner or team
+      description: Who can answer questions about this consumer?
+      placeholder: Claims Platform
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## 🟢 Environment and consumer group
+
+        Choose where the platform team should **preview** the request first.
+        A feature-branch preview targets one environment. Merging the shared
+        consumer manifest targets all four environments. Test and prod have
+        separate deployment approvals.
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: First preview environment
+      options:
+        - sandbox
+        - dev
+        - test
+        - prod
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target_group
+    attributes:
+      label: Target consumer group
+      description: The default group has a 50,000-token limit and the custom group has a 100,000-token limit. Both use a 60-second sliding window.
+      options:
+        - default-consumer-group
+        - custom-consumer-group
+    validations:
+      required: true
+
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason for the request
+      description: Describe how the application uses the gateway and why it needs the selected group. For a move, include its current group.
+      placeholder: |
+        The Claims Review API summarizes adjuster notes.
+        Its expected token usage fits the default consumer group.
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## 🟠 What happens after submission?
+
+        The platform team links this issue to a pull request for `konnect/consumer.yaml`.
+
+        - **New consumer:** Use `type: api-key` and the ref `<target-group>--<consumer-name>`.
+        - **Group move:** Keep the consumer name and change only the group prefix in its existing ref.
